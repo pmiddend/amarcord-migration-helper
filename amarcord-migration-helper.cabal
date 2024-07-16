@@ -1,0 +1,33 @@
+cabal-version:      3.4
+name:               amarcord-migration-helper
+version:            1.0
+-- synopsis:
+-- description:
+license:            GPL-3.0-or-later
+license-file:       LICENSE
+author:             Philipp Middendorf
+maintainer:         philipp.middendorf@desy.de
+-- copyright:
+category:           Database
+build-type:         Simple
+-- extra-source-files:
+
+common warnings
+    ghc-options: -Wall -rtsopts
+
+executable amarcord-migration-helper
+    import:           warnings
+    main-is:          Main.hs
+    -- other-modules:
+    -- other-extensions:
+    build-depends:    base ^>=4.17.2.1
+                    , http-client
+                    , lens-aeson
+                    , containers
+                    , text
+                    , lens
+                    , bytestring
+                    , attoparsec
+                    , regex-compat
+    hs-source-dirs:   app
+    default-language: Haskell2010
