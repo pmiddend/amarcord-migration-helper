@@ -13,7 +13,7 @@ build-type:         Simple
 -- extra-source-files:
 
 common warnings
-    ghc-options: -Wall -rtsopts
+    ghc-options: -Wall -rtsopts -O3
 
 executable amarcord-migration-helper
     import:           warnings
@@ -29,5 +29,10 @@ executable amarcord-migration-helper
                     , bytestring
                     , attoparsec
                     , regex-compat
+                    , conduit
+                    , crypton
+                    , directory
+                    , filepath
+                    , async-pool
     hs-source-dirs:   app
     default-language: Haskell2010
