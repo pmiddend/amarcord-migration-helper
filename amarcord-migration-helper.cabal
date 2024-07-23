@@ -34,5 +34,7 @@ executable amarcord-migration-helper
                     , directory
                     , filepath
                     , async-pool
+                    , terminal-progress-bar
+                    , unix
     hs-source-dirs:   app
     default-language: Haskell2010

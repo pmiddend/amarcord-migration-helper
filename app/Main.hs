@@ -7,7 +7,7 @@ module Main where
 import Conduit
 import Control.Applicative ((<|>))
 import Control.Lens (ix, traversed, (^.), (^..), (^?))
-import Control.Monad (forM_, mapM)
+import Control.Monad (forM, forM_, mapM)
 import qualified Crypto.Hash as Crypto
 import Crypto.Hash.Algorithms (SHA256)
 import Data.Aeson.Lens
@@ -25,8 +25,10 @@ import qualified Data.Text.IO as TIO
 import qualified Data.Text.Lazy as TL
 import qualified Data.Text.Lazy.Encoding as TLE
 import Network.HTTP.Client
-import System.Directory (listDirectory)
-import System.FilePath ((</>))
+import System.Directory (doesFileExist, listDirectory)
+import System.FilePath (dropFileName, (</>))
+import System.Posix.Files (getSymbolicLinkStatus, isSymbolicLink, readSymbolicLink)
+import System.ProgressBar (Progress (Progress), Style (stylePostfix), defStyle, exact, incProgress, newProgressBar, remainingTime, renderDuration)
 import Text.Read (readMaybe)
 import Text.Regex
 
@@ -56,11 +58,16 @@ polishCommandLine cli =
       regexRemove needle haystack = regexReplace needle haystack ""
       regexRemovals =
         mkRegex
-          <$> [ "--asapo-[^ =]*[ =][^ ]*",
-                "-j [0-9]+",
+          <$> [ "-j [0-9]+",
                 "--data-format=[^ ]+",
                 "-p [^ ]+",
+                "--asapo-[^ =]*[ =][^ ]*",
                 "-g [^ ]+",
+                "-j[0-9]+",
+                "--temp-dir=[^ ]+",
+                "--no-data-timeout=[^ ]+",
+                "--mille-dir=[^ ]+",
+                "--cpu-pin",
                 "--profile",
                 "-o [^ ]+",
                 "indexamajig"
@@ -68,11 +75,11 @@ polishCommandLine cli =
       afterRemovals = foldr regexRemove actualCli regexRemovals
    in T.strip (regexReplace (mkRegex "[ ]+") afterRemovals " ")
 
-extractGeometryFromCommandLine :: T.Text -> Maybe T.Text
+extractGeometryFromCommandLine :: T.Text -> Maybe FilePath
 extractGeometryFromCommandLine cli =
   case matchRegex (mkRegex "-g ([^ ]+)") (T.unpack cli) of
     Nothing -> Nothing
-    Just (geometry : _) -> Just (T.pack geometry)
+    Just (geometry : _) -> Just geometry
 
 data StreamFileDirectInformation = StreamFileDirectInformation
   { rawCrystfelVersion :: Maybe T.Text,
@@ -99,13 +106,14 @@ conduitForStreamDirectInformation = do
   generatedByCrystFel <- headC
   dropWhileC (\line -> not ("indexamajig" `BS.isInfixOf` line))
   indexamajig <- headC
-  imagesAndHits <-
-    getZipSink
-      ( (,,)
-          <$> ZipSink (lengthIfC (\line -> line == "----- Begin chunk -----"))
-          <*> ZipSink (lengthIfC (\line -> line == "hit = 1"))
-          <*> ZipSink (lengthIfC (\line -> "indexed_by = a" `BS.isPrefixOf` line))
-      )
+  -- imagesAndHits <-
+  --   getZipSink
+  --     ( (,,)
+  --         <$> ZipSink (lengthIfC (\line -> line == "----- Begin chunk -----"))
+  --         <*> ZipSink (lengthIfC (\line -> line == "hit = 1"))
+  --         <*> ZipSink (lengthIfC (\line -> "indexed_by = a" `BS.isPrefixOf` line))
+  --     )
+  let imagesAndHits = (0, 0, 0)
   pure
     ( StreamFileDirectInformation
         (TE.decodeUtf8 <$> generatedByCrystFel)
@@ -120,6 +128,19 @@ extractStreamFileDirectInformation fileName =
       .| linesUnboundedAsciiC
       .| conduitForStreamDirectInformation
 
+readSymlinkOrDoNothing :: FilePath -> IO FilePath
+readSymlinkOrDoNothing fp = do
+  status <- getSymbolicLinkStatus fp
+  if isSymbolicLink status
+    then do
+      resolvedLink <- readSymbolicLink fp
+      let finalPath = dropFileName fp </> resolvedLink
+      exists <- doesFileExist finalPath
+      if exists
+        then pure finalPath
+        else error $ "path " <> finalPath <> " does not exist"
+    else pure fp
+
 extractStreamFileInformation :: FilePath -> IO (Either T.Text StreamFileInformation)
 extractStreamFileInformation fileName = do
   output <- extractStreamFileDirectInformation fileName
@@ -132,30 +153,33 @@ extractStreamFileInformation fileName = do
           case extractGeometryFromCommandLine commandLine' of
             Nothing -> pure (Left "couldn't extract geometry file from command line")
             Just geometryFile' -> do
-              geometryFileContents <- BS.readFile (T.unpack geometryFile')
+              symlink <- readSymlinkOrDoNothing geometryFile'
+              geometryFileContents <- BS.readFile geometryFile'
               let geometryHash = sha256HashAsText geometryFileContents
               pure $
                 Right $
                   StreamFileInformation
                     (extractVersion crystfelVersion)
                     (polishCommandLine commandLine')
-                    geometryFile'
+                    (T.pack symlink)
                     geometryHash
                     (rawFoms output)
 
 sha256HashAsText :: BS.ByteString -> T.Text
 sha256HashAsText bs = T.pack (show (Crypto.hash bs :: Crypto.Digest SHA256))
 
-retrieveStreamFiles :: FilePath -> IO [(FilePath, ExternalRunId)]
-retrieveStreamFiles baseDir = do
+defaultStreamRegex = "run_([0-9]+).*\\.stream"
+
+retrieveStreamFiles :: Maybe String -> FilePath -> IO [(FilePath, ExternalRunId)]
+retrieveStreamFiles regexToUse baseDir = do
   files <- listDirectory baseDir
   let parsePath :: FilePath -> Maybe (FilePath, ExternalRunId)
-      parsePath fp = (fp,) <$> (matchRegex (mkRegex "run_([0-9]+).*\\.stream") fp >>= listToMaybe >>= readMaybe)
+      parsePath fp = (fp,) <$> (matchRegex (mkRegex (fromMaybe defaultStreamRegex regexToUse)) fp >>= listToMaybe >>= readMaybe)
   pure (mapMaybe parsePath files)
 
 processBeamTimeStream externalToInternalRunId baseDir (streamFileName, externalRunId) = do
   let streamFile = baseDir </> streamFileName
-  TIO.putStrLn $ "reading data for run " <> T.pack (show externalRunId)
+  -- TIO.putStrLn $ "reading data for run " <> T.pack (show externalRunId)
   case Map.lookup externalRunId externalToInternalRunId of
     Nothing -> pure $ Left $ "couldn't find internal run ID for run " <> T.pack (show externalRunId)
     Just internalRunId -> do
@@ -165,7 +189,16 @@ processBeamTimeStream externalToInternalRunId baseDir (streamFileName, externalR
         Right v -> pure $ Right $ (internalRunId, v)
 
 printParams :: StreamFileInformation -> T.Text
-printParams params = "\"crystfel_version\": \"" <> streamFileCrystfelVersion params <> "\""
+printParams params =
+  let pairs =
+        [ ("crystfel_version", streamFileCrystfelVersion params),
+          ("geometry_file", streamFileGeometry params),
+          ("geometry_hash", streamFileGeometryHash params),
+          ("command_line", streamFileCommandLine params)
+        ]
+      quote x = "\"" <> x <> "\""
+      makePair (a, b) = quote a <> ": " <> quote b
+   in T.intercalate "," (makePair <$> pairs)
 
 printRange :: (Integer, Integer) -> T.Text
 printRange (from, to) = "(" <> T.pack (show from) <> ", " <> T.pack (show to) <> ")"
@@ -186,11 +219,15 @@ foldIntervals list@(x NE.:| xs) =
             then (oldPairs, (startSequence, endSequence + 1))
             else ((startSequence, endSequence) : oldPairs, (newNumber, newNumber))
 
-migrate113 = do
-  externalToInternalRunId <- retrieveExternalToInternalIdMap 113
-  let baseDir = "/asap3/petra3/gpfs/p11/2022/data/11015430/processed/streams/"
-  streamFiles <- retrieveStreamFiles baseDir
-  infos <- mapM (\streamFile -> processBeamTimeStream externalToInternalRunId baseDir streamFile) streamFiles
+migrateDefault streamFileRegex baseDir internalId = do
+  externalToInternalRunId <- retrieveExternalToInternalIdMap internalId
+  streamFiles <- retrieveStreamFiles streamFileRegex baseDir
+  let numberOfStreamFiles = length streamFiles
+  pb <- newProgressBar (defStyle {stylePostfix = exact <> " " <> remainingTime renderDuration "N/A"}) 10 (Progress 0 numberOfStreamFiles ())
+  infos <-
+    forM (zip [0 ..] streamFiles) \(ix, streamFile) -> do
+      incProgress pb 1
+      processBeamTimeStream externalToInternalRunId baseDir streamFile
   let (errors, infos') = partitionEithers infos
       groups :: [NE.NonEmpty (InternalRunId, StreamFileInformation)]
       groups =
@@ -205,6 +242,31 @@ migrate113 = do
          in printRunsWithParameters runRanges parameters
 
   forM_ (mapGroup <$> groups) \stream -> TIO.putStrLn stream
+
+migrate113 = migrateDefault Nothing "/asap3/petra3/gpfs/p11/2022/data/11015430/processed/streams/" 113
+
+migrate114 = migrateDefault Nothing "/asap3/petra3/gpfs/p11/2022/data/11015490/processed/streams/" 114
+
+migrate115 = migrateDefault Nothing "/asap3/petra3/gpfs/p11/2023/data/11016853/processed/" 115
+
+migrate116 = migrateDefault Nothing "/asap3/petra3/gpfs/p11/2023/data/11016848/processed/" 116
+
+migrate120 = migrateDefault (Just "run-([0-9]+).*\\.stream") "/asap3/petra3/gpfs/p11/2024/data/11017935/processed/indexing-results" 120
+
+migrate122 = migrateDefault (Just "run-([0-9]+).*\\.stream") "/asap3/petra3/gpfs/p11/2024/data/11019287/processed/indexing-results" 122
+
+migrate121 = migrateDefault (Just "run-([0-9]+).*\\.stream") "/asap3/petra3/gpfs/p11/2024/data/11019287/processed/indexing-results" 121
+
+main = do
+  resolvedGeom <- readSymlinkOrDoNothing "/asap3/petra3/gpfs/p11/2024/data/11019287/shared/geometry.geom"
+  putStrLn $ "resolved geom: " <> resolvedGeom
+  let migrations = [migrate113, migrate114, migrate115, migrate116, migrate120, migrate121, migrate122]
+      numMigrations = length migrations
+  pb <- newProgressBar (defStyle {stylePostfix = exact <> " " <> remainingTime renderDuration "N/A"}) 10 (Progress 0 numMigrations ())
+  forM_ migrations \migration -> do
+    TIO.putStrLn "next migration"
+    migration
+    incProgress pb 1
 
 -- forM_ infos \x -> case x of
 --   Left e -> TIO.putStrLn $ "error " <> e
