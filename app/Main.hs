@@ -7,7 +7,7 @@ module Main where
 import Conduit
 import Control.Applicative ((<|>))
 import Control.Lens (ix, traversed, (^.), (^..), (^?))
-import Control.Monad (forM, forM_, mapM)
+import Control.Monad (forM, forM_, join, mapM)
 import qualified Crypto.Hash as Crypto
 import Crypto.Hash.Algorithms (SHA256)
 import Data.Aeson.Lens
@@ -219,6 +219,7 @@ foldIntervals list@(x NE.:| xs) =
             then (oldPairs, (startSequence, endSequence + 1))
             else ((startSequence, endSequence) : oldPairs, (newNumber, newNumber))
 
+migrateDefault :: Maybe String -> FilePath -> Int -> IO [T.Text]
 migrateDefault streamFileRegex baseDir internalId = do
   externalToInternalRunId <- retrieveExternalToInternalIdMap internalId
   streamFiles <- retrieveStreamFiles streamFileRegex baseDir
@@ -241,7 +242,7 @@ migrateDefault streamFileRegex baseDir internalId = do
             parameters = snd (NE.head g)
          in printRunsWithParameters runRanges parameters
 
-  forM_ (mapGroup <$> groups) \stream -> TIO.putStrLn stream
+  pure (mapGroup <$> groups)
 
 migrate113 = migrateDefault Nothing "/asap3/petra3/gpfs/p11/2022/data/11015430/processed/streams/" 113
 
@@ -253,20 +254,20 @@ migrate116 = migrateDefault Nothing "/asap3/petra3/gpfs/p11/2023/data/11016848/p
 
 migrate120 = migrateDefault (Just "run-([0-9]+).*\\.stream") "/asap3/petra3/gpfs/p11/2024/data/11017935/processed/indexing-results" 120
 
-migrate122 = migrateDefault (Just "run-([0-9]+).*\\.stream") "/asap3/petra3/gpfs/p11/2024/data/11019287/processed/indexing-results" 122
-
 migrate121 = migrateDefault (Just "run-([0-9]+).*\\.stream") "/asap3/petra3/gpfs/p11/2024/data/11019287/processed/indexing-results" 121
 
+migrate122 = migrateDefault (Just "run-([0-9]+).*\\.stream") "/asap3/petra3/gpfs/p11/2024/data/11019287/processed/indexing-results" 122
+
 main = do
-  resolvedGeom <- readSymlinkOrDoNothing "/asap3/petra3/gpfs/p11/2024/data/11019287/shared/geometry.geom"
-  putStrLn $ "resolved geom: " <> resolvedGeom
   let migrations = [migrate113, migrate114, migrate115, migrate116, migrate120, migrate121, migrate122]
       numMigrations = length migrations
   pb <- newProgressBar (defStyle {stylePostfix = exact <> " " <> remainingTime renderDuration "N/A"}) 10 (Progress 0 numMigrations ())
-  forM_ migrations \migration -> do
+  allMigrationLines <- forM migrations \migration -> do
     TIO.putStrLn "next migration"
-    migration
+    result <- migration
     incProgress pb 1
+    pure result
+  TIO.putStrLn (T.unlines (join allMigrationLines))
 
 -- forM_ infos \x -> case x of
 --   Left e -> TIO.putStrLn $ "error " <> e
